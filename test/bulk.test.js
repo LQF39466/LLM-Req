@@ -192,7 +192,7 @@ test('manual resume ignores stale in-flight cooldowns but new rate errors still 
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(ctl.cooldown, 0, kind);
     assert.equal(ctl.failures, 0, kind);
-    w.rateLimited('openai', { epoch: ctl.epoch }, false, 60000, 1000);
+    ctl.limited({ epoch: ctl.epoch, load: 1 }, 1, false, 60000, 1000);
     assert.equal(ctl.cooldown, 61000, kind);
     await w.stop();
     s.db.close();
@@ -297,7 +297,7 @@ test('OpenCode models probe, fix concurrency, pace and cool down independently a
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(w.control(opus).observed, 3); // Excludes Qwen's three in-flight requests.
   assert.equal(w.control(opus).cap, 2);
-  assert.equal(w.control(opus).mode, 'fixed');
+  assert.equal(w.control(opus).mode, 'adaptive');
   assert.equal(w.control(opus).cooldown, now + 60000);
   assert.equal(w.control(qwen).cap, 3);
   assert.equal(w.control(qwen).mode, 'probe');
@@ -506,6 +506,12 @@ test('batchOperate patch_config fixes blocked preflight and partial held items, 
   assert.equal(sum2.batches[0].config.maxOutputTokens, 128);
   assert.equal(sum2.batches[1].config.maxOutputTokens, 1024);
   assert.equal(sum2.state, 'running');
+  // A replacement config still needs its first real sample, even on a running job.
+  w.batchOperate(imp2.id, { action: 'patch_config', ids: [rows2[2].id],
+    config: { provider: 'openai', model: 'bad-model' } });
+  await step(2);
+  assert.equal(s.summary(imp2.id).state, 'preflight_blocked');
+  w.itemAction(rows2[2].id, 'retry', { config: { provider: 'openai', model: 'good-model', maxOutputTokens: 1024 } });
   await step(4);
   assert.equal(s.summary(imp2.id).state, 'completed');
   await w.stop();

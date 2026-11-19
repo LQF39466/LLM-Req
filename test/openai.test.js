@@ -147,3 +147,64 @@ test('explicit credential refresh loads a new key from dotenv without exposing o
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('named Chat endpoint accepts keyless non-streaming calls and propagates Retry-After to its queue', async (t) => {
+  const { Store } = await import('../src/store.js');
+  const { Scheduler } = await import('../src/scheduler.js');
+  const { setTimeout: sleep } = await import('node:timers/promises');
+  const requests = [];
+  let unavailable = false;
+  const server = createServer(async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    requests.push({ body: JSON.parse(raw), path: req.url, auth: req.headers.authorization });
+    if (unavailable) {
+      res.writeHead(503, { 'retry-after': '120', 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'maintenance' } }));
+    } else {
+      res.writeHead(200, { 'content-type': 'application/json', 'x-request-id': 'local-request' });
+      res.end(JSON.stringify({
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hello' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 5, completion_tokens: 1, cost: 0.01 },
+      }));
+    }
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const localURL = process.env.LLM_FIXTURE_BASE_URL, localKey = process.env.LLM_FIXTURE_API_KEY;
+  process.env.LLM_FIXTURE_BASE_URL = `http://127.0.0.1:${server.address().port}/local/v1`;
+  delete process.env.LLM_FIXTURE_API_KEY;
+  t.after(async () => {
+    if (localURL === undefined) delete process.env.LLM_FIXTURE_BASE_URL; else process.env.LLM_FIXTURE_BASE_URL = localURL;
+    if (localKey === undefined) delete process.env.LLM_FIXTURE_API_KEY; else process.env.LLM_FIXTURE_API_KEY = localKey;
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  });
+
+  const config = validateConfig({ provider: 'fixture', model: 'my-model', stream: false });
+  const result = await invoke(config, { prompt: 'hello' });
+  assert.equal(result.partial, 'hello');
+  assert.equal(result.usage.inputTokens, 5);
+  assert.equal(result.cost, 0.01);
+  assert.equal(result.requestId, 'local-request');
+  assert.equal(requests[0].path, '/local/v1/chat/completions');
+  assert.equal(requests[0].auth, undefined);
+  assert.ok(!requests[0].body.stream);
+  unavailable = true;
+  const store = new Store(':memory:');
+  t.after(() => store.db.close());
+  const now = 1_000_000;
+  const scheduler = new Scheduler(store, { clock: () => now });
+  const job = store.begin({ config });
+  store.append(job, ['hello']);
+  store.seal(job);
+  scheduler.tick();
+  const deadline = Date.now() + 3000;
+  while (scheduler.active.size && Date.now() < deadline) await sleep(10);
+  assert.equal(requests.length, 2);
+  const row = store.get('SELECT state, next, error FROM items');
+  assert.equal(row.state, 'waiting');
+  assert.equal(JSON.parse(row.error).status, 503);
+  assert.equal(row.next, now + 120_000);
+  assert.equal(scheduler.control('fixture').cooldown, row.next);
+});

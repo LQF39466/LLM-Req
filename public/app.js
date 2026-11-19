@@ -565,8 +565,8 @@ function controlsTable(rows) {
             h(
               "td",
               {},
-              ctl.mode === "fixed"
-                ? h("span", { class: "tag ok", title: ctl.observed ? `触及 429 时在途 ${ctl.observed}` : null }, `已锁定上限${ctl.observed ? ` (峰值 ${ctl.observed})` : ""}`)
+              ctl.mode === "adaptive"
+                ? h("span", { class: "tag ok", title: ctl.observed ? `触及 429 时在途 ${ctl.observed}` : null }, `自适应上限 ${ctl.cap}`)
                 : h("span", { class: "tag" }, `探测中 (上限 ${ctl.cap || 64})`),
             ),
             h("td", { class: `num ${ctl.interval > 50 ? "cool" : ""}` }, `${ctl.interval || 0} ms`),
@@ -907,8 +907,8 @@ function renderBatchesTable(j) {
           `${ctl.interval || 0} ms · ${
             cooling
               ? `冷却至 ${new Date(ctl.cooldown).toLocaleTimeString()}`
-              : ctl.mode === "fixed"
-                ? "正常"
+              : ctl.mode === "adaptive"
+                ? "自适应"
                 : "探测中"
           }`,
         ),

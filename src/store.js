@@ -63,14 +63,11 @@ export class Store {
     }
   }
   begin(spec) {
-    if (
-      !spec ||
-      typeof spec !== "object" ||
-      !Array.isArray(spec.batches) ||
-      !spec.batches.length
-    )
-      throw Error("batches 不能为空");
-    if (spec.batches.length > 1000) throw Error("最多 1000 个配置批次");
+    const single = spec?.config !== undefined;
+    if (single && spec.batches !== undefined) throw Error("config 与 batches 只能选一个");
+    const definitions = single ? [{ id: "main", config: spec.config }] : spec?.batches;
+    if (!Array.isArray(definitions) || !definitions.length) throw Error("batches 不能为空");
+    if (definitions.length > 1000) throw Error("最多 1000 个配置批次");
     if (
       spec.submissionKey !== undefined &&
       (typeof spec.submissionKey !== "string" ||
@@ -96,7 +93,7 @@ export class Store {
         Date.now(),
       );
       const batches = new Map();
-      for (const b of spec.batches) {
+      for (const b of definitions) {
         if (typeof b.id !== "string" || !b.id || batches.has(b.id))
           throw Error("batch.id 缺失或重复");
         const body = canonical(validateConfig(b.config));
@@ -111,16 +108,21 @@ export class Store {
         );
         batches.set(b.id, cid);
       }
-      return { id, batches, count: 0 };
+      return { id, batches, single, count: 0 };
     });
   }
   append(importer, rows) {
+    if (importer.count + rows.length > 100000) throw Error("Job 最多 100000 条");
     this.tx(() => {
-      for (const q of rows) {
+      for (const [index, row] of rows.entries()) {
+        let q = row;
+        if (importer.single) {
+          const fields = typeof row === "string" ? { prompt: row } : row;
+          q = { id: String(importer.count + index + 1), batch: "main", ...fields };
+        }
         validateQuery(q);
         const config = importer.batches.get(q.batch);
         if (!config) throw Error(`未知 batch: ${q.batch}`);
-        if (++importer.count > 100000) throw Error("Job 最多 100000 条");
         this.run(
           "INSERT INTO items(job,config,query_id,input) VALUES(?,?,?,?)",
           importer.id,
@@ -130,6 +132,7 @@ export class Store {
         );
       }
     });
+    importer.count += rows.length;
   }
   seal(importer) {
     if (!importer.count) throw Error("Job 不能为空");

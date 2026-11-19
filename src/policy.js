@@ -1,18 +1,16 @@
+import { endpoint } from "./endpoints.js";
+export { usesSystemOne } from "./endpoints.js";
+
 export const defaults = {
   connectMs: 60_000,
   idleMs: 300_000,
   totalMs: 1_800_000,
 };
-const systemOneModels = new Set(["gemini-decision-1", "jev-1.13"]);
-export function usesSystemOne(config) {
-  return config.provider === "opencode" &&
-    (config.protocol === "systemone" || systemOneModels.has(config.model));
-}
-
 const allowed = new Set([
   "provider",
   "model",
   "protocol",
+  "stream",
   "questions",
   "temperature",
   "topP",
@@ -67,21 +65,10 @@ export function validateConfig(c) {
     throw Error("config 必须是对象");
   for (const key of Object.keys(c))
     if (!allowed.has(key)) throw Error(`未知配置参数: ${key}`);
-  if (!["deepseek", "mimo", "bailian", "opencode", "openai"].includes(c.provider))
-    throw Error("未知 provider");
   if (typeof c.model !== "string" || !c.model.trim()) throw Error("model 必填");
-  if (
-    c.protocol &&
-    !["chat", "responses", "anthropic", "google", "systemone"].includes(c.protocol)
-  )
-    throw Error("protocol 无效");
-  if (c.provider === "openai" && c.protocol && !["chat", "responses"].includes(c.protocol))
-    throw Error("OpenAI 官方接口仅支持 chat / responses 协议");
-  if (!["opencode", "openai"].includes(c.provider) && c.protocol && c.protocol !== "chat")
-    throw Error("当前该平台适配器使用 chat 协议");
-  if (usesSystemOne(c)) {
-    if (c.protocol && c.protocol !== "systemone")
-      throw Error("该 OpenCode 决策模型使用 systemone 协议");
+  const { protocol } = endpoint(c);
+  if (c.stream !== undefined && typeof c.stream !== "boolean") throw Error("stream 必须是 boolean");
+  if (protocol === "systemone") {
     for (const key of Object.keys(c))
       if (!["provider", "model", "protocol", "questions", "timeout"].includes(key))
         throw Error(`systemone 不支持配置参数 ${key}`);
@@ -122,6 +109,8 @@ export function validateConfig(c) {
     throw Error("temperature 不得为负");
   if (c.logprobs !== undefined && typeof c.logprobs !== "boolean")
     throw Error("logprobs 必须是 boolean");
+  if (c.logprobs === true && !["chat", "responses"].includes(protocol))
+    throw Error(`当前 ${protocol} 协议不支持统一 logprobs`);
   if (c.topLogprobs !== undefined &&
       (!Number.isInteger(c.topLogprobs) || c.topLogprobs < 0 || c.topLogprobs > 20))
     throw Error("topLogprobs 必须是 0–20 的整数");
@@ -207,137 +196,5 @@ function sort(x) {
         )
       : x;
 }
-export function classify(error) {
-  if (error.code === "MISSING_API_KEY") return { kind: "auth", count: false };
-  const status = error.statusCode || error.status;
-  const msg = [error.message, error.responseBody]
-    .filter(Boolean)
-    .join(" ")
-    .slice(0, 12000);
-  let cause = error;
-  const codes = [];
-  for (let i = 0; cause && i < 8; i++, cause = cause.cause)
-    codes.push(cause.code, cause.name);
-  if (
-    error.kind === "content" ||
-    /content.?filter|data.?inspection|inappropriate|content.?policy|blocked.*safety|safety.*(?:block|filter)|内容.*拦截/i.test(
-      msg,
-    ) ||
-    status === 421
-  )
-    return { kind: "content", count: true };
-  // AllocationQuota / insufficient_quota can mean TPM at Bailian: never infer balance from that alone.
-  if (
-    status === 402 ||
-    /arrearage|insufficient.?balance|credit.balance.exhausted|余额不足|payment.required|plan.*exhaust|套餐.*耗尽/i.test(
-      msg,
-    )
-  )
-    return { kind: "quota", count: true };
-  if (
-    status === 429 ||
-    /throttl|rate.?limit|limit_requests|limit_burst|allocationquota|insufficient_quota/i.test(
-      msg,
-    )
-  )
-    return { kind: "rate", count: false };
-  if (status === 401 || status === 403) return { kind: "auth", count: true };
-  // OpenCode wraps an upstream response/adapter failure in HTTP 400.
-  // The envelope is valid JSON; this does not mean the user's parameters are invalid.
-  if (/upstream request failed/i.test(msg) && /upstream response was not valid JSON/i.test(msg))
-    return { kind: "transient", count: true };
-  if (
-    status === 400 ||
-    status === 404 ||
-    status === 422 ||
-    /UnsupportedParameter|InvalidParameter|unsupported.*setting|未知配置|不支持参数/i.test(
-      msg,
-    )
-  )
-    return { kind: "parameter", count: true };
-  if (
-    codes.some((c) =>
-      [
-        "CERT_HAS_EXPIRED",
-        "DEPTH_ZERO_SELF_SIGNED_CERT",
-        "ERR_TLS_CERT_ALTNAME_INVALID",
-      ].includes(c),
-    )
-  )
-    return { kind: "configuration", count: true };
-  if (
-    codes.some((c) =>
-      [
-        "ENOTFOUND",
-        "EAI_AGAIN",
-        "ECONNREFUSED",
-        "UND_ERR_CONNECT_TIMEOUT",
-      ].includes(c),
-    )
-  )
-    return { kind: "unsent", count: false };
-  if (
-    status === 408 ||
-    status === 504 ||
-    error.name === "TimeoutError" ||
-    codes.some((c) =>
-      [
-        "ECONNRESET",
-        "EPIPE",
-        "UND_ERR_SOCKET",
-        "UND_ERR_HEADERS_TIMEOUT",
-        "UND_ERR_BODY_TIMEOUT",
-      ].includes(c),
-    ) ||
-    /fetch failed|terminated|network|premature|stream.*(closed|ended)/i.test(
-      msg,
-    )
-  )
-    return { kind: "interrupted", count: true };
-  if (status >= 500 || status === 408)
-    return { kind: "transient", count: true };
-  if (error.kind) return { kind: error.kind, count: true };
-  return { kind: "unknown", count: true };
-}
-export function decide(
-  kind,
-  attempts,
-  interruptions,
-  now = Date.now(),
-  retryAfter = 0,
-) {
-  if (kind === "content") return { state: "succeeded", next: 0 };
-  if (kind === "rate" || kind === "unsent")
-    return {
-      state: "waiting",
-      next: now + Math.max(retryAfter, kind === "rate" ? 60_000 : 300_000),
-    };
-  if (attempts >= 3) return { state: "held", next: 0 };
-  if (kind === "interrupted")
-    return interruptions >= 2
-      ? { state: "held", next: 0 }
-      : { state: "waiting", next: now + 300_000 };
-  if (kind === "transient")
-    return {
-      state: "waiting",
-      next:
-        now +
-        Math.max(
-          retryAfter,
-          2000 * 2 ** (attempts - 1) + Math.floor(Math.random() * 1000),
-        ),
-    };
-  return { state: "held", next: 0 };
-}
 
-// Keep original partial output for inspection; consumers must honor the filter flag.
-export function contentFilteredResult(capture, reason) {
-  return {
-    ...capture,
-    partial: capture.partial || "",
-    reasoning: capture.reasoning || "",
-    finishReason: "content-filter",
-    contentFiltered: true,
-    contentFilter: reason,
-  };
-}
+export { classify, decide, contentFilteredResult } from "./retry.js";

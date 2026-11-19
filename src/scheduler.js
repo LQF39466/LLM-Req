@@ -1,16 +1,11 @@
 import { randomUUID, createHash } from "node:crypto";
-import {
-  classify,
-  contentFilteredResult,
-  decide,
-  canonical,
-  validateConfig,
-  validateQuery,
-} from "./policy.js";
+import { canonical, validateConfig, validateQuery } from "./policy.js";
+import { classify, contentFilteredResult, decide } from "./retry.js";
 import { invoke, errorRecord, refreshCredentials } from "./providers.js";
-export function controlKey(config) {
-  return config.provider === "opencode" ? `opencode:${config.model}` : config.provider;
-}
+import { ConcurrencyWindow, controlKey } from "./concurrency.js";
+import { keyVariable } from "./endpoints.js";
+export { controlKey };
+
 export class Scheduler {
   constructor(
     store,
@@ -37,10 +32,11 @@ export class Scheduler {
     this.reloadCredentials = reloadCredentials;
     this.clock = clock;
     this.globalMax = globalMax;
-    this.probeMax = probeMax;
+    this.probeMax = Math.min(globalMax, probeMax);
     this.probeInterval = probeInterval;
     this.active = new Map();
     this.controls = new Map();
+    this.loads = new Map();
     this.stopped = false;
     this.fatal = null;
     for (const r of store.all("SELECT * FROM controls")) {
@@ -49,45 +45,15 @@ export class Scheduler {
         store.run("DELETE FROM controls WHERE provider=?", r.provider);
         continue;
       }
-      const ctl = JSON.parse(r.body);
-      const now = this.clock();
-      if (ctl.version !== 2) {
-        // Old releases multiplied once per response, not once per congestion wave.
-        // Keep the discovered concurrency and server cooldown; reset only pacing.
-        ctl.migration = { previousInterval: ctl.interval, at: now };
-        ctl.interval = Math.min(
-          ctl.interval,
-          Math.max(250, this.probeInterval),
-        );
-        ctl.next = Math.max(now, ctl.cooldown);
-        ctl.version = 2;
-        ctl.epoch = 0;
-      }
-      // An unthrottled probe adopts the configured pacing on restart.
-      if (ctl.mode === "probe" && ctl.epoch === 0) {
-        ctl.interval = this.probeInterval;
-        ctl.next = Math.max(now, ctl.cooldown);
-      }
-      ctl.healthy = 0;
-      ctl.stableSince = Math.max(now, ctl.cooldown);
-      this.controls.set(r.provider, ctl);
+      this.controls.set(r.provider, new ConcurrencyWindow(
+        this.probeMax, probeInterval, clock(), JSON.parse(r.body),
+      ));
       this.save(r.provider);
     }
   }
   control(provider) {
     if (!this.controls.has(provider))
-      this.controls.set(provider, {
-        version: 2,
-        epoch: 0,
-        healthy: 0,
-        stableSince: this.clock(),
-        mode: "probe",
-        cap: this.probeMax,
-        interval: this.probeInterval,
-        next: 0,
-        cooldown: 0,
-        failures: 0,
-      });
+      this.controls.set(provider, new ConcurrencyWindow(this.probeMax, this.probeInterval, this.clock()));
     return this.controls.get(provider);
   }
   save(provider) {
@@ -97,65 +63,20 @@ export class Scheduler {
       JSON.stringify(this.control(provider)),
     );
   }
-  rateLimited(provider, attempt, preflight, retryAfter, now) {
-    const ctl = this.control(provider);
-    // Responses dispatched before a manual resume cannot restore its cleared cooldown.
-    if (attempt.epoch < (ctl.resumeEpoch ?? 0)) return;
-    if (attempt.epoch === ctl.epoch) {
-      // Every already-dispatched request keeps the old epoch, even if its
-      // response arrives after cooldown or after a newer wave has started.
-      if (ctl.mode === "probe" && !preflight) {
-        ctl.observed = this.inFlight(provider);
-        ctl.cap = Math.max(1, Math.floor(ctl.observed * 0.7));
-        ctl.mode = "fixed";
-        ctl.detectedAt = now;
-      } else {
-        ctl.interval = Math.min(60000, Math.max(250, ctl.interval * 2));
-      }
-      ctl.epoch++;
-      ctl.cooldown = Math.max(ctl.cooldown, now + Math.max(60000, retryAfter));
-      ctl.next = Math.max(ctl.next, ctl.cooldown);
-    } else if (retryAfter > 0) {
-      // Old responses cannot multiply pacing, but explicit server waits apply.
-      ctl.cooldown = Math.max(ctl.cooldown, now + retryAfter);
-      ctl.next = Math.max(ctl.next, ctl.cooldown);
-    }
-    ctl.healthy = 0;
-    ctl.stableSince = Math.max(now, ctl.cooldown);
-  }
-  recoverRate(provider, attempt, now) {
-    const ctl = this.control(provider);
-    // Only requests sent under the current policy count as recovery evidence.
-    if (
-      attempt.epoch !== ctl.epoch ||
-      attempt.started < ctl.stableSince ||
-      now < ctl.cooldown
-    )
-      return;
-    ctl.healthy++;
-    if (
-      ctl.healthy < 10 ||
-      now - ctl.stableSince < 60000 ||
-      ctl.interval <= this.probeInterval
-    )
-      return;
-    ctl.interval = Math.max(this.probeInterval, Math.floor(ctl.interval / 2));
-    ctl.next = Math.max(ctl.cooldown, Math.min(ctl.next, now + ctl.interval));
-    ctl.healthy = 0;
-    ctl.stableSince = now;
-  }
   inFlight(provider) {
-    return [...this.active.values()].filter((x) => x.scope === provider)
-      .length;
+    return this.loads.get(provider) ?? 0;
   }
   start() {
-    this.timer = setInterval(() => {
+    if (this.timer || this.stopped) return;
+    const poll = () => {
       try {
-        this.tick();
+        const busy = this.tick();
+        if (!this.stopped) this.timer = setTimeout(poll, busy ? 10 : 250);
       } catch (e) {
         this.storageFault(e);
       }
-    }, 10);
+    };
+    poll();
   }
   storageFault(e) {
     this.fatal = e.message;
@@ -163,7 +84,8 @@ export class Scheduler {
     console.error("服务停止派发，持久化/调度异常:", e.message);
   }
   tick() {
-    if (this.stopped) return;
+    if (this.stopped) return false;
+    if (this.active.size >= this.globalMax) return true;
     const jobs = this.s.all(
       "SELECT * FROM jobs WHERE state IN ('preflight','running') ORDER BY created",
     );
@@ -214,43 +136,23 @@ export class Scheduler {
           row &&
           (!["queued", "waiting"].includes(row.state) || row.next > now)
         ) {
-          if (row.state === "held" && job.state === "preflight")
+          if (row.state === "held" && !c.checked) {
             this.s.run(
               "UPDATE jobs SET state='preflight_blocked',error=? WHERE id=?",
               row.error,
               job.id,
             );
+            break;
+          }
           continue;
         }
         if (!row) {
-          if (
-            !c.checked &&
-            !this.s.get(
-              "SELECT 1 FROM items WHERE config=? AND state!='skipped' LIMIT 1",
-              c.id,
-            )
-          ) {
-            this.s.run("UPDATE configs SET checked=1 WHERE id=?", c.id);
-            continue;
-          }
-          if (job.state === "preflight") {
-            this.s.run(
-              "UPDATE jobs SET state='preflight_blocked',error=? WHERE id=?",
-              JSON.stringify({
-                message: "预检样本挂起或缺失，请重试该条；也可跳过整个批次",
-              }),
-              job.id,
-            );
-          }
+          // The unchecked query above includes every non-skipped state.
+          if (!c.checked) this.s.run("UPDATE configs SET checked=1 WHERE id=?", c.id);
           continue;
         }
-        // One representative per distinct effective config. Other duplicates stay queued until it passes.
-        if (
-          !c.checked &&
-          [...this.active.values()].some((a) => a.config === c.id)
-        )
-          continue;
-        this.dispatch(row, c, config, !c.checked, job.state === "preflight");
+        if (!c.checked && [...this.active.values()].some(a => a.config === c.id)) continue;
+        this.dispatch(row, c, config);
         control.next = now + control.interval;
       }
       if (
@@ -265,14 +167,15 @@ export class Scheduler {
           job.id,
         );
         this.s.run(
-          "UPDATE jobs SET state=? WHERE id=?",
+          "UPDATE jobs SET state=? WHERE id=? AND state='running'",
           held ? "needs_attention" : "completed",
           job.id,
         );
       }
     }
+    return jobs.length > 0;
   }
-  dispatch(item, c, config, checking, preflight) {
+  dispatch(item, c, config) {
     const id = randomUUID(),
       started = this.clock();
     this.s.tx(() => {
@@ -289,10 +192,12 @@ export class Scheduler {
       );
     });
     const abort = new AbortController();
+    const scope = controlKey(config);
+    const control = this.control(scope);
+    const load = this.inFlight(scope) + 1;
+    this.loads.set(scope, load);
     this.active.set(id, {
-      provider: config.provider,
-      scope: controlKey(config),
-      epoch: this.control(controlKey(config)).epoch,
+      provider: config.provider, scope, load, cap: control.cap, epoch: control.epoch,
       started,
       job: item.job,
       config: c.id,
@@ -303,33 +208,34 @@ export class Scheduler {
         this.call(config, JSON.parse(item.input), { signal: abort.signal }),
       )
       .then(
-        (r) => this.finish(id, item, c, r, null, checking, preflight),
-        (e) => this.finish(id, item, c, null, e, checking, preflight),
+        (r) => this.finish(id, item, c, r, null),
+        (e) => this.finish(id, item, c, null, e),
       )
       .catch((e) => this.storageFault(e))
-      .finally(() => this.active.delete(id));
+      .finally(() => {
+        this.active.delete(id);
+        this.loads.set(scope, this.inFlight(scope) - 1);
+      });
   }
-  finish(id, item, c, result, error, checking, preflight) {
-    const now = this.clock(),
-      config = JSON.parse(c.body),
-      scope = controlKey(config),
-      ctl = this.control(scope);
+  finish(id, item, c, result, error) {
+    const now = this.clock();
+    const attempt = this.active.get(id);
+    const scope = attempt.scope;
+    const ctl = this.control(scope);
+    const checking = !c.checked;
     const capture = result || error?.capture || {};
-    let rec = null,
-      classification = null,
-      decision = { state: "succeeded", next: 0 };
-    if (error && classify(error).kind === "content") {
-      rec = { ...errorRecord(error), kind: "content" };
+    const classification = error ? classify(error, attempt.provider) : null;
+    const rec = error ? { ...errorRecord(error), kind: classification.kind } : null;
+    let decision = { state: "succeeded", next: 0 };
+    if (classification?.kind === "content") {
       result = contentFilteredResult(capture, rec);
       error = null; // A moderation block is a completed outcome, not an operator task.
     }
-    const current = this.s.get("SELECT * FROM items WHERE id=?", item.id);
-    let attempts = current.attempts,
-      interruptions = current.interruptions,
-      freeFailures = current.free_failures;
+    // Running items cannot be edited before this attempt settles.
+    let attempts = item.attempts + 1,
+      interruptions = item.interruptions,
+      freeFailures = item.free_failures;
     if (error) {
-      classification = classify(error);
-      rec = { ...errorRecord(error), kind: classification.kind };
       if (!classification.count) {
         attempts--;
         freeFailures++;
@@ -347,25 +253,13 @@ export class Scheduler {
         rec.message += "；连续免费重试达到 20 次，需人工处理";
       }
       if (classification.kind === "rate") {
-        this.rateLimited(
-          scope,
-          this.active.get(id),
-          preflight,
-          capture.retryAfter || 0,
-          now,
-        );
-      } else if (classification.kind === "unsent" &&
-                 this.active.get(id).epoch >= (ctl.resumeEpoch ?? 0)) {
-        ctl.cooldown = Math.max(ctl.cooldown, now + 300000);
-      } else if (classification.kind === "transient" &&
-                 this.active.get(id).epoch >= (ctl.resumeEpoch ?? 0)) {
-        ctl.failures++;
-        if (ctl.failures >= 3) ctl.cooldown = now + 60000;
+        ctl.limited(attempt, this.inFlight(scope), checking, capture.retryAfter || 0, now);
+      } else {
+        ctl.unavailable(attempt, classification.kind, capture.retryAfter || 0, now);
       }
     } else {
-      ctl.failures = 0;
       freeFailures = 0;
-      this.recoverRate(scope, this.active.get(id), now);
+      ctl.succeeded(attempt, now);
     }
     this.s.tx(() => {
       this.s.run(
@@ -404,9 +298,9 @@ export class Scheduler {
           item.job,
           c.fingerprint,
         );
-      if (preflight && error && decision.state === "held")
+      if (checking && decision.state === "held")
         this.s.run(
-          "UPDATE jobs SET state='preflight_blocked',error=? WHERE id=? AND state='preflight'",
+          "UPDATE jobs SET state='preflight_blocked',error=? WHERE id=? AND state IN ('preflight', 'running')",
           JSON.stringify(rec),
           item.job,
         );
@@ -430,7 +324,7 @@ export class Scheduler {
       );
       for (const provider of new Set(authItems.map(i => JSON.parse(i.body).provider))) {
         if (!this.reloadCredentials(provider))
-          throw Error(`${provider.toUpperCase()}_API_KEY 未配置；请补充 .env 后再次恢复`);
+          throw Error(`${keyVariable(provider)} 未配置；请补充 .env 后再次恢复`);
       }
       this.s.tx(() => {
         const now = this.clock();
@@ -440,12 +334,7 @@ export class Scheduler {
         );
         for (const scope of new Set(providers.map(r => controlKey(JSON.parse(r.body))))) {
           const ctl = this.control(scope);
-          ctl.cooldown = 0;
-          ctl.next = now;
-          ctl.failures = 0;
-          ctl.healthy = 0;
-          ctl.stableSince = now;
-          ctl.resumeEpoch = ++ctl.epoch;
+          ctl.resume(now);
           this.save(scope);
         }
         this.s.run(
@@ -518,7 +407,7 @@ export class Scheduler {
         this.s.get("SELECT body FROM configs WHERE id=?", i.config).body,
       );
       if (!this.reloadCredentials(config.provider))
-        throw Error(`${config.provider.toUpperCase()}_API_KEY 未配置；请补充 .env 后再次重试`);
+        throw Error(`${keyVariable(config.provider)} 未配置；请补充 .env 后再次重试`);
     }
     this.s.tx(() => {
       let cid = i.config,
@@ -615,7 +504,7 @@ export class Scheduler {
           .map(row => JSON.parse(row.body).provider));
         for (const provider of providers)
           if (!this.reloadCredentials(provider))
-            throw Error(`${provider.toUpperCase()}_API_KEY 未配置；批量重试未执行`);
+            throw Error(`${keyVariable(provider)} 未配置；批量重试未执行`);
       }
       for (const row of rows) {
         this.s.run(
@@ -796,7 +685,7 @@ export class Scheduler {
         rows.some((r) => JSON.parse(r.error || "null")?.kind === "auth") &&
         !this.reloadCredentials(validated.provider)
       )
-        throw Error(`${validated.provider.toUpperCase()}_API_KEY 未配置；批量修改未执行`);
+        throw Error(`${keyVariable(validated.provider)} 未配置；批量修改未执行`);
 
       const byOldConfig = new Map();
       for (const r of rows) {
@@ -891,7 +780,7 @@ export class Scheduler {
   }
   async stop() {
     this.stopped = true;
-    clearInterval(this.timer);
+    clearTimeout(this.timer);
     for (const a of this.active.values())
       a.abort.abort(
         Object.assign(Error("服务关闭，结果不确定"), { name: "TimeoutError" }),

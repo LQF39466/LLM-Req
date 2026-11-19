@@ -117,7 +117,7 @@ test("timeout waits five minutes, pins preflight sample and hangs on second inte
   assert.equal(s.get("SELECT attempts FROM items WHERE id=1").attempts, 2);
   s.db.close();
 });
-test("429 snapshots in-flight before removal, fixes 70%, does not count attempts", async () => {
+test("429 snapshots in-flight before removal, backs off to 70%, does not count attempts", async () => {
   let pending = [];
   const { s, w, advance } = fixture(async (c, q) => {
     if (q.id === "1") return success;
@@ -137,7 +137,7 @@ test("429 snapshots in-flight before removal, fixes 70%, does not count attempts
   pending[0].reject(Object.assign(Error("rate limit"), { statusCode: 429 }));
   await new Promise((r) => setImmediate(r));
   assert.equal(w.control("deepseek").cap, 2);
-  assert.equal(w.control("deepseek").mode, "fixed");
+  assert.equal(w.control("deepseek").mode, "adaptive");
   assert.equal(s.get("SELECT attempts FROM items WHERE id=2").attempts, 0);
   assert.equal(s.get("SELECT counted FROM attempts WHERE item=2").counted, 0);
   for (const x of pending.slice(1)) x.resolve(success);
@@ -193,7 +193,7 @@ test("Bailian TPM quota is rate limit, MiMo 421 content, unsent excluded", () =>
     "rate",
   );
   assert.equal(
-    classify(Object.assign(Error("blocked"), { statusCode: 421 })).kind,
+    classify(Object.assign(Error("blocked"), { statusCode: 421 }), "mimo").kind,
     "content",
   );
   assert.equal(
@@ -203,6 +203,8 @@ test("Bailian TPM quota is rate limit, MiMo 421 content, unsent excluded", () =>
     false,
   );
   assert.equal(decide("transient", 3, 0).state, "held");
+  assert.equal(classify({ statusCode: 421 }, "openai").kind, "unknown");
+  assert.equal(classify({ statusCode: 429, message: "insufficient_quota" }, "openai").kind, "quota");
 });
 test("HTTP streaming import is atomic and duplicate IDs never dispatch", async () => {
   const { s, w } = fixture(async () => success);
@@ -227,6 +229,15 @@ test("HTTP streaming import is atomic and duplicate IDs never dispatch", async (
     });
     assert.equal(ok.status, 201);
     assert.equal(s.jobs()[0].state, "preflight");
+    const compact = await fetch(base + "/api/jobs", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config, queries: ["hello", { id: "custom", messages: [{ role: "user", content: "hi" }] }] }),
+    });
+    assert.equal(compact.status, 201);
+    const { id } = await compact.json();
+    await tick(w, 6);
+    assert.deepEqual(s.all("SELECT query_id, state FROM items WHERE job=? ORDER BY id", id)
+      .map(row => [row.query_id, row.state]), [["1", "succeeded"], ["custom", "succeeded"]]);
     const denied = await fetch(base + "/api/jobs", {
       method: "POST",
       headers: {
@@ -396,18 +407,18 @@ test("committed WAL survives SIGKILL and stale process lock is reclaimed", async
   }
 });
 
-test("OpenCode Anthropic and Google protocol paths parse streams and cost", async () => {
+test("gateway and direct Anthropic and Google paths, authentication, streams and cost", async (t) => {
   const oldKey = process.env.OPENCODE_API_KEY,
     oldBase = process.env.OPENCODE_BASE_URL;
-  let path, received, blocked = false;
+  let path, received, requestHeaders, blocked = false;
   const server = createServer(async (req, res) => {
     path = req.url;
     let body = "";
     for await (const b of req) body += b;
     received = JSON.parse(body);
-    assert.equal(req.headers.authorization, "Bearer fixture");
+    requestHeaders = req.headers;
     res.writeHead(200, { "Content-Type": "text/event-stream" });
-    const events = blocked ? [{ promptFeedback: { blockReason: "SAFETY" } }] : path.includes("anthropic")
+    const events = blocked ? [{ promptFeedback: { blockReason: "SAFETY" } }] : path.endsWith("/messages")
       ? [
           {
             type: "message_start",
@@ -475,6 +486,7 @@ test("OpenCode Anthropic and Google protocol paths parse streams and cost", asyn
       { prompt: "x" },
     );
     assert.equal(path, "/anthropic/v1/messages");
+    assert.equal(requestHeaders.authorization, "Bearer fixture");
     assert.deepEqual(received.thinking, { type: "adaptive" });
     assert.equal(received.output_config.effort, "low");
     assert.equal(out.partial, "hello");
@@ -511,6 +523,25 @@ test("OpenCode Anthropic and Google protocol paths parse streams and cost", asyn
       received.generationConfig.thinkingConfig.thinkingLevel,
       undefined,
     );
+    for (const [provider, model, pathPrefix, keyHeader] of [
+      ["anthropic", "claude-test", "/v1/messages", "x-api-key"],
+      ["google", "gemini-test", "/v1beta/models/", "x-goog-api-key"],
+    ]) {
+      const prefix = provider.toUpperCase();
+      for (const [name, value] of Object.entries({
+        [prefix + "_API_KEY"]: "direct-fixture",
+        [prefix + "_BASE_URL"]: process.env.OPENCODE_BASE_URL + (provider === "google" ? "/v1beta" : "/v1"),
+      })) {
+        const old = process.env[name];
+        t.after(() => { if (old === undefined) delete process.env[name]; else process.env[name] = old; });
+        process.env[name] = value;
+      }
+      const direct = await invoke({ provider, model }, { prompt: "hi" });
+      assert.equal(direct.partial, "hello");
+      assert.ok(path.startsWith(pathPrefix));
+      assert.equal(requestHeaders[keyHeader], "direct-fixture");
+      assert.equal(requestHeaders.authorization, undefined);
+    }
   } finally {
     if (oldKey === undefined) delete process.env.OPENCODE_API_KEY;
     else process.env.OPENCODE_API_KEY = oldKey;
@@ -530,7 +561,7 @@ test("Python generator submits chunked JSONL and reads status/results", async ()
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   try {
-    const script = `import sys,json\nsys.path.insert(0,${JSON.stringify(fileURLToPath(new URL("../examples", import.meta.url)))})\nfrom python_client import LLMJobs\nc=LLMJobs('http://127.0.0.1:${server.address().port}')\nj=c.submit(name='python',submission_key='python-test',batches=[{'id':'a','config':{'provider':'deepseek','model':'test'}}],queries=({'id':str(i),'batch':'a','prompt':'测试'} for i in range(1000)))\ns=c.status(j)\nprint(json.dumps({'state':s['state'],'count':s['counts']['queued'],'exported':sum(1 for x in c.results(j))}))\n`;
+    const script = `import sys,json\nsys.path.insert(0,${JSON.stringify(fileURLToPath(new URL("../examples", import.meta.url)))})\nfrom python_client import LLMJobs\nc=LLMJobs('http://127.0.0.1:${server.address().port}')\nj=c.submit(name='python',submission_key='python-test',batches=[{'id':'a','config':{'provider':'deepseek','model':'test'}}],queries=({'id':str(i),'batch':'a','prompt':'测试'} for i in range(1000)))\ncompact=c.submit(config={'provider':'deepseek','model':'test'},queries=('测试' for _ in range(251)))\nassert [row['query_id'] for row in c.results(compact)] == [str(i+1) for i in range(251)]\ns=c.status(j)\nprint(json.dumps({'state':s['state'],'count':s['counts']['queued'],'exported':sum(1 for x in c.results(j))}))\n`;
     const { stdout } = await promisify(execFile)("python3", ["-c", script]);
     assert.deepEqual(JSON.parse(stdout), {
       state: "preflight",
@@ -608,6 +639,38 @@ test("OpenCode Responses routes GPT and retains raw cost", async () => {
   }
 });
 
+test("saturated successful windows grow, recover after a 429 and respect a lower maximum on restart", async () => {
+  const pending = [];
+  const { s, w, advance } = fixture(() => new Promise((resolve, reject) => pending.push({ resolve, reject })),
+    { globalMax: 6, probeMax: 8 });
+  job(s, [{ id: "a", config }], Array.from({ length: 40 }, (_, i) => ({ id: String(i), batch: "a", prompt: "x" })));
+  s.run("UPDATE configs SET checked=1");
+  s.run("UPDATE jobs SET state='running'");
+  const ctl = w.control("deepseek");
+  await tick(w, 8);
+  assert.equal(pending.length, 4);
+  const complete = async () => {
+    for (const p of pending.splice(0)) p.resolve(success);
+    await new Promise(resolve => setImmediate(resolve));
+  };
+  await complete();
+  assert.equal(ctl.cap, 6);
+  await tick(w, 8);
+  assert.equal(pending.length, 6);
+  pending.shift().reject(Object.assign(Error("rate"), { statusCode: 429 }));
+  await complete();
+  assert.equal(ctl.cap, 4);
+  advance(60_000);
+  for (let round = 0; round < 3; round++) {
+    await tick(w, 4);
+    advance(20_000);
+    await complete();
+  }
+  assert.equal(ctl.cap, 5);
+  assert.equal(new Scheduler(s, { probeMax: 2 }).control("deepseek").cap, 2);
+  s.db.close();
+});
+
 test("a burst of 429s reduces pacing once per dispatch epoch, then recovers gradually", async () => {
   const pending = [];
   const { s, w, advance } = fixture(
@@ -641,6 +704,7 @@ test("a burst of 429s reduces pacing once per dispatch epoch, then recovers grad
       advance(spacing);
     }
   };
+  w.control("deepseek").cap = 50; // A previously learned window.
   await launch(50, 100);
   for (let i = 0; i < 8; i++) await limited(i);
   const ctl = w.control("deepseek");
@@ -662,16 +726,22 @@ test("a burst of 429s reduces pacing once per dispatch epoch, then recovers grad
   assert.equal(ctl.epoch, 2);
   assert.equal(s.get("SELECT sum(attempts) n FROM items").n, 41);
   advance(60000);
-  await launch(10, 250);
-  for (const p of pending.slice(60, 69)) p.resolve(success);
+  await launch(7, 250);
+  for (const p of pending.slice(60, 66)) p.resolve(success);
+  await flush();
+  await launch(3, 250);
+  for (const p of pending.slice(66, 69)) p.resolve(success);
   await flush();
   assert.equal(ctl.interval, 250, "nine successes do not recover the rate");
   advance(60000);
   pending[69].resolve(success);
   await flush();
   assert.equal(ctl.interval, 125);
-  assert.equal(ctl.cap, 35);
-  await launch(10, 125);
+  assert.equal(ctl.cap, 7); // A second congestion wave at ten in flight.
+  await launch(7, 125);
+  for (const p of pending.slice(70, 73)) p.resolve(success);
+  await flush();
+  await launch(3, 125);
   advance(60000);
   for (const p of pending.slice(70)) p.resolve(success);
   await flush();

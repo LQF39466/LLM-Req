@@ -45,10 +45,16 @@ class LLMJobs:
         finally:
             conn.close()
 
-    def submit(self, *, name, batches, queries, submission_key=None):
-        """batches is a small config list; queries may be a lazy generator."""
+    def submit(self, *, queries, config=None, batches=None, name=None, submission_key=None):
+        """Submit prompts or query records for one config, or tagged records for multiple batches."""
+        if (config is None) == (batches is None):
+            raise ValueError("Pass exactly one of config or batches")
+        if isinstance(queries, (str, bytes, dict)):
+            raise ValueError("Pass an iterable of queries, e.g. [prompt]")
         def chunks():
-            header = {"name": name, "batches": batches}
+            header = {"config": config} if config is not None else {"batches": batches}
+            if name is not None:
+                header["name"] = name
             if submission_key is not None:
                 header["submissionKey"] = submission_key
             yield (json.dumps(header, ensure_ascii=False) + "\n").encode("utf-8")

@@ -59,14 +59,15 @@ async function importJSONL(req, store, state) {
 async function importJSON(req, store, state) {
   const spec = await readJSON(req, MAX_JSON_BYTES);
   state.importer = store.begin(spec);
-  for (const batch of spec.batches) {
+  const single = state.importer.single;
+  if (!single && spec.queries !== undefined) throw Error("多个批次请将 queries 放入对应 batch");
+  for (const batch of single ? [spec] : spec.batches) {
     if (!Array.isArray(batch.queries))
       throw Error("JSON 格式每个 batch 必须有 queries 数组");
-    for (let k = 0; k < batch.queries.length; k += CHUNK_ROWS)
-      store.append(
-        state.importer,
-        batch.queries.slice(k, k + CHUNK_ROWS).map((q) => ({ ...q, batch: batch.id })),
-      );
+    for (let k = 0; k < batch.queries.length; k += CHUNK_ROWS) {
+      const rows = batch.queries.slice(k, k + CHUNK_ROWS);
+      store.append(state.importer, single ? rows : rows.map(q => ({ ...q, batch: batch.id })));
+    }
   }
 }
 
