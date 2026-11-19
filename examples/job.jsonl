@@ -1,0 +1,3 @@
+{"name":"JSONL 示例","submissionKey":"example-jsonl-001","batches":[{"id":"main","config":{"provider":"deepseek","model":"deepseek-flash","maxOutputTokens":2048,"thinking":"off"}}]}
+{"id":"q1","batch":"main","prompt":"简要介绍数据库事务。","metadata":{"source":"sample"}}
+{"id":"q2","batch":"main","messages":[{"role":"system","content":"使用中文简洁回答。"},{"role":"user","content":"什么是并发限制？"}]}

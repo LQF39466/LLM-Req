@@ -1,0 +1,19 @@
+{
+  "name": "文本批处理示例",
+  "submissionKey": "example-001",
+  "batches": [
+    {
+      "id": "deepseek-summary",
+      "config": {
+        "provider": "deepseek",
+        "model": "deepseek-flash",
+        "maxOutputTokens": 2048,
+        "thinking": "off"
+      },
+      "queries": [
+        { "id": "summary-001", "prompt": "用一句话解释 SQLite WAL。" },
+        { "id": "summary-002", "prompt": "用一句话解释指数退避。" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "name": "OpenAI 官方接口示例",
+  "submissionKey": "openai-example-001",
+  "batches": [
+    {
+      "id": "main",
+      "config": {
+        "provider": "openai",
+        "model": "gpt-5.5",
+        "maxOutputTokens": 4096,
+        "thinking": "low"
+      },
+      "queries": [
+        { "id": "q1", "prompt": "用一句话解释 SQLite WAL。" }
+      ]
+    }
+  ]
+}

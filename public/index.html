@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>LLM Jobs · 本地调度</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">L</span>
+        <div class="brand-text">
+          <b>LLM Jobs</b>
+          <small class="brand-sub">LOCAL BATCH ENGINE</small>
+        </div>
+      </div>
+      <div class="row">
+        <span id="connection" class="conn" data-ok="true" title="实时连接正常"><i></i><span></span></span>
+        <button id="theme-toggle" class="btn ghost sm" type="button" title="切换明暗主题">◐ 跟随系统</button>
+      </div>
+    </header>
+
+    <div id="banner" class="banner" role="alert" hidden></div>
+
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="side-top">
+          <button id="nav-overview" class="nav selected" type="button">
+            <span>总览</span>
+            <span id="nav-attention-count" class="nav-pill" hidden></span>
+          </button>
+          <div class="side-head">
+            <h2 class="side-title">任务列表</h2>
+            <small id="side-scope" class="muted">近 3 天活跃</small>
+          </div>
+          <input id="job-search" class="input sm" type="search" placeholder="搜索任务名称..." aria-label="搜索任务名称" />
+        </div>
+        <ul id="jobs" class="job-list"></ul>
+        <p id="jobs-empty" class="muted side-empty" hidden>暂无活跃任务</p>
+        <div class="side-foot">
+          <button id="toggle-archived" class="btn ghost sm full" type="button" aria-pressed="false">
+            显示历史任务 (0)
+          </button>
+        </div>
+      </aside>
+
+      <main>
+        <!-- 总览 -->
+        <div id="overview">
+          <div class="page-head">
+            <div class="title">
+              <h1>运行总览</h1>
+              <span id="overview-subtitle" class="muted"></span>
+            </div>
+          </div>
+
+          <div id="kpis" class="kpis"></div>
+
+          <div class="section-head">
+            <h2 class="section-title">需要关注</h2>
+            <small id="attention-sub" class="muted"></small>
+          </div>
+          <div id="attention" class="card flush"></div>
+
+          <div class="section-head">
+            <h2 class="section-title">全局并发与限流控制器</h2>
+          </div>
+          <div id="overview-controls" class="card flush"></div>
+        </div>
+
+        <!-- 任务详情 -->
+        <div id="detail" hidden>
+          <div class="page-head">
+            <div class="title-block">
+              <div class="title">
+                <h1 id="name"></h1>
+                <span id="state" class="badge"></span>
+              </div>
+              <div id="job-meta" class="job-meta"></div>
+            </div>
+            <div class="row">
+              <button id="pause" class="btn" type="button">暂停派发</button>
+              <button id="resume" class="btn" type="button" title="恢复任务并立即解除相关冷却及本任务等待">恢复派发</button>
+              <a id="export" class="btn">导出 JSONL</a>
+              <button id="delete-job" class="btn danger-ghost" type="button" title="删除此任务及关联数据">删除任务</button>
+            </div>
+          </div>
+
+          <section id="diagnosis" class="card diagnosis" hidden></section>
+
+          <section class="card">
+            <div class="progress-head">
+              <div class="row">
+                <b id="progress-text"></b>
+                <span id="progress-sub" class="muted"></span>
+              </div>
+              <small class="muted">点击下方状态可快速筛选明细</small>
+            </div>
+            <div id="progress" class="stack" aria-hidden="true"></div>
+            <div id="counts" class="legend"></div>
+          </section>
+
+          <div class="section-head">
+            <h2 class="section-title">批次、并发与用量</h2>
+          </div>
+          <div id="providers" class="card flush"></div>
+
+          <div id="items-section" class="section-head">
+            <h2 class="section-title">请求明细</h2>
+          </div>
+          <section class="card flush">
+            <div class="toolbar">
+              <div id="filters" class="tabs" role="tablist"></div>
+              <div class="row toolbar-right">
+                <select id="batch-filter" class="select sm" aria-label="按批次筛选">
+                  <option value="">全部批次</option>
+                </select>
+                <input id="item-search" class="input sm search-box" type="search" placeholder="搜索 Query ID / 错误 / 输出..." aria-label="搜索请求明细" />
+                <div class="pager">
+                  <button id="first" class="btn sm" type="button">首页</button>
+                  <button id="prev" class="btn sm" type="button">← 上一页</button>
+                  <span id="page-info" class="muted page-info"></span>
+                  <button id="next" class="btn sm" type="button">下一页 →</button>
+                </div>
+              </div>
+            </div>
+
+            <div id="bulk" class="bulk" hidden>
+              <span id="selected-count" class="bulk-count">已选 0 条</span>
+              <select id="bulk-scope" class="select sm" aria-label="批量处置范围">
+                <option value="selected">所选条目</option>
+                <option id="bulk-filtered-option" value="filtered" disabled>当前筛选全部（跨页）</option>
+              </select>
+              <button id="bulk-retry" class="btn sm" type="button" disabled>批量重试</button>
+              <button id="bulk-patch" class="btn sm" type="button" disabled>改配并重试…</button>
+              <button id="bulk-refuse" class="btn sm" type="button" disabled>批量标记拒答</button>
+              <button id="bulk-skip" class="btn sm" type="button" disabled>批量跳过</button>
+            </div>
+
+            <div class="table-wrap tall">
+              <table>
+                <thead>
+                  <tr>
+                    <th class="chk"><input id="select-page" type="checkbox" aria-label="选择本页可处置条目" /></th>
+                    <th>Query / 批次</th>
+                    <th>状态</th>
+                    <th>尝试 / 耗时</th>
+                    <th class="num">Token / 费用</th>
+                    <th>输出预览 / 错误诊断</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody id="items"></tbody>
+              </table>
+              <p id="items-empty" class="empty-row" hidden>没有符合条件的请求</p>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+
+    <!-- 单条详情与处置弹窗 -->
+    <dialog id="modal">
+      <header class="modal-head">
+        <div id="modal-title" class="modal-title"></div>
+        <div class="row">
+          <button id="prev-item" class="btn ghost sm" type="button" title="上一条 (←)">← 上一条</button>
+          <button id="next-item" class="btn ghost sm" type="button" title="下一条 (→)">下一条 →</button>
+          <button id="close" class="btn ghost sm" type="button" aria-label="关闭">✕</button>
+        </div>
+      </header>
+      <div class="modal-body">
+        <div id="modal-outcome" class="outcome-stack"></div>
+
+        <section class="modal-section">
+          <h3>输入内容</h3>
+          <div id="messages-view" class="messages-view" hidden></div>
+          <div id="messages-override-bar" class="row" hidden>
+            <button id="toggle-prompt-override" class="btn sm" type="button">替换为纯 Prompt 覆盖重发</button>
+            <small class="muted">不替换时，保存配置重试将保留原始 messages 会话</small>
+          </div>
+          <div id="prompt-wrap">
+            <div class="field-head">
+              <span id="prompt-label">Prompt</span>
+              <button id="format-prompt" class="btn ghost sm" type="button" hidden>格式化 JSON</button>
+            </div>
+            <textarea id="prompt" rows="5"></textarea>
+          </div>
+        </section>
+
+        <section class="modal-section">
+          <div class="field-head">
+            <h3>模型与参数配置</h3>
+            <small class="muted">修改配置将重新预检该配置，重试可能再次计费</small>
+          </div>
+          <div id="item-quick-cfg" class="quick-cfg">
+            <label class="qfield">
+              <span>Model</span>
+              <input id="item-cfg-model" class="input sm" type="text" />
+            </label>
+            <label class="qfield">
+              <span>Thinking</span>
+              <select id="item-cfg-thinking" class="select sm">
+                <option value="__default__">默认（不指定）</option>
+                <option value="off">off</option>
+                <option value="minimal">minimal</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="xhigh">xhigh</option>
+                <option value="max">max</option>
+                <option value="__custom__" disabled>自定义对象</option>
+              </select>
+            </label>
+            <label class="qfield qfield-wide">
+              <span>Max Output Tokens</span>
+              <div class="row">
+                <input id="item-cfg-max" class="input sm num-input" type="number" min="1" step="1" placeholder="默认" />
+                <div class="preset-row" data-target="item">
+                  <button type="button" class="chip" data-val="256">256</button>
+                  <button type="button" class="chip" data-val="512">512</button>
+                  <button type="button" class="chip" data-val="1024">1024</button>
+                  <button type="button" class="chip" data-val="2048">2048</button>
+                  <button type="button" class="chip" data-val="4096">4096</button>
+                </div>
+              </div>
+            </label>
+            <label class="qfield">
+              <span>Temperature</span>
+              <input id="item-cfg-temp" class="input sm num-input" type="number" min="0" step="0.1" placeholder="默认" />
+            </label>
+          </div>
+          <label class="field">
+            <span>配置 JSON</span>
+            <textarea id="config" rows="8" spellcheck="false"></textarea>
+          </label>
+        </section>
+
+        <section class="modal-section">
+          <h3>尝试与操作时间线</h3>
+          <ol id="attempts" class="timeline"></ol>
+        </section>
+
+        <details class="raw-details">
+          <summary>原始数据（已解码内嵌 JSON）</summary>
+          <pre id="history"></pre>
+        </details>
+      </div>
+      <footer class="modal-foot">
+        <button id="skip" class="btn" type="button">跳过</button>
+        <button id="refuse" class="btn" type="button">标记拒答并算作成功</button>
+        <button id="retry" class="btn primary" type="button">保存并重试</button>
+      </footer>
+    </dialog>
+
+    <!-- 批次 / 批量改配弹窗 -->
+    <dialog id="config-modal">
+      <header class="modal-head">
+        <h2 id="cfg-modal-title">修改配置</h2>
+        <button id="cfg-close" class="btn ghost sm" type="button" aria-label="关闭">✕</button>
+      </header>
+      <div class="modal-body">
+        <div id="cfg-scope-banner" class="scope-box"></div>
+        <div id="batch-quick-cfg" class="quick-cfg">
+          <label class="qfield">
+            <span>Model</span>
+            <input id="batch-cfg-model" class="input sm" type="text" />
+          </label>
+          <label class="qfield">
+            <span>Thinking</span>
+            <select id="batch-cfg-thinking" class="select sm">
+              <option value="__default__">默认（不指定）</option>
+              <option value="off">off</option>
+              <option value="minimal">minimal</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+              <option value="xhigh">xhigh</option>
+              <option value="max">max</option>
+              <option value="__custom__" disabled>自定义对象</option>
+            </select>
+          </label>
+          <label class="qfield qfield-wide">
+            <span>Max Output Tokens</span>
+            <div class="row">
+              <input id="batch-cfg-max" class="input sm num-input" type="number" min="1" step="1" placeholder="默认" />
+              <div class="preset-row" data-target="batch">
+                <button type="button" class="chip" data-val="256">256</button>
+                <button type="button" class="chip" data-val="512">512</button>
+                <button type="button" class="chip" data-val="1024">1024</button>
+                <button type="button" class="chip" data-val="2048">2048</button>
+                <button type="button" class="chip" data-val="4096">4096</button>
+                <button type="button" class="chip" data-val="8192">8192</button>
+              </div>
+            </div>
+          </label>
+          <label class="qfield">
+            <span>Temperature</span>
+            <input id="batch-cfg-temp" class="input sm num-input" type="number" min="0" step="0.1" placeholder="默认" />
+          </label>
+        </div>
+        <label class="field">
+          <span>配置 JSON</span>
+          <textarea id="cfg-json" rows="10" spellcheck="false"></textarea>
+        </label>
+        <label class="check-line">
+          <input id="cfg-retry" type="checkbox" checked />
+          <span>同时将范围中「挂起 / 等待重试」的条目重新排队重试（将触发预检并可能再次计费）</span>
+        </label>
+      </div>
+      <footer class="modal-foot">
+        <button id="cfg-cancel" class="btn" type="button">取消</button>
+        <button id="cfg-submit" class="btn primary" type="button">应用配置</button>
+      </footer>
+    </dialog>
+
+    <div id="toasts" class="toasts" aria-live="polite"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

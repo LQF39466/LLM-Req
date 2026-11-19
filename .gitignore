@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+!.env.example
+/data/*
+!/data/.gitkeep
+/LLM-Req.zip
+*.log
+__pycache__/
+*.py[cod]
+.DS_Store
